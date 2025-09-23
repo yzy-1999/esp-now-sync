@@ -84,3 +84,43 @@ menu "Example Configuration"
             ESPNOW wake interval
 
 endmenu
+
+menu "Time Synchronization Configuration"
+
+    config TIME_SYNC_MASTER_MAC
+        string "Master Device MAC Address"
+        default "FC:01:2C:F9:0E:F0"
+        help
+            Set the MAC address of the master (time server) device.
+            All other devices will automatically become slaves.
+
+    config TIME_SYNC_INTERVAL
+        int "Sync Interval (ms)"
+        range 1000 60000
+        default 10000
+        help
+            Time synchronization interval in milliseconds for slave devices.
+            
+    config TIME_SYNC_TIMEOUT
+        int "Sync Timeout (ms)"
+        range 1000 30000
+        default 5000
+        help
+            Timeout for synchronization requests in milliseconds.
+            
+    config TIME_SYNC_ENABLE_FILTER
+        bool "Enable Time Filtering"
+        default y
+        help
+            Enable filtering to smooth out time synchronization measurements.
+            This improves stability but may increase convergence time.
+            
+    config TIME_SYNC_FILTER_SIZE
+        int "Filter History Size"
+        range 4 16
+        default 8
+        depends on TIME_SYNC_ENABLE_FILTER
+        help
+            Number of historical measurements to use for filtering.
+
+endmenu
