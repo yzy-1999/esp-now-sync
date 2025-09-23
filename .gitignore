@@ -1,0 +1,38 @@
+# ESP-IDF 构建文件
+build/
+sdkconfig
+sdkconfig.old
+
+# 编译器生成文件
+*.o
+*.a
+*.so
+*.exe
+*.dll
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+venv/
+env/
+
+# 其他
+.env
