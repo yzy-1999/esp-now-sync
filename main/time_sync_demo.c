@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -22,7 +23,7 @@ static const char *TAG = "time_sync_demo";
 
 // 配置：根据设备MAC地址自动分配角色
 // 这里预设一个主机MAC地址，其他设备自动成为从机
-static uint8_t master_mac[ESP_NOW_ETH_ALEN] = {0xFC, 0x01, 0x2C, 0xF9, 0x0E, 0xF0}; // 修改为你的主机MAC
+static uint8_t master_mac[ESP_NOW_ETH_ALEN] = {0xFC, 0x01, 0x2C, 0xF9, 0x0E, 0xF0}; // COM3设备作为主机
 
 // 获取设备角色
 static time_sync_role_t get_device_role(void) {
@@ -59,14 +60,14 @@ static void espnow_init(void) {
     ESP_LOGI(TAG, "ESP-NOW initialized");
 }
 
+
 // 时间同步事件回调
 static void time_sync_event_handler(time_sync_role_t role, bool success, int64_t offset_us) {
     if (success) {
-        ESP_LOGI(TAG, "Time sync successful! Role: %s, Offset: %" PRId64 " us", 
-                 role == TIME_SYNC_ROLE_MASTER ? "MASTER" : "SLAVE",
-                 offset_us);
+        ESP_LOGI(TAG, "Sync OK: %s, Offset: %" PRId64 "us", 
+                 role == TIME_SYNC_ROLE_MASTER ? "MASTER" : "SLAVE", offset_us);
     } else {
-        ESP_LOGW(TAG, "Time sync failed!");
+        ESP_LOGW(TAG, "Sync failed");
     }
 }
 
@@ -76,58 +77,32 @@ static void stats_task(void *pvParameters) {
     precise_timestamp_t local_time, synced_time;
     
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 每5秒打印一次统计信息
+        vTaskDelay(pdMS_TO_TICKS(15000)); // 每15秒打印一次统计信息
         
-        if (time_sync_get_stats(&stats) == ESP_OK) {
+        if (time_sync_get_stats(&stats) == ESP_OK && stats.sync_count > 0) {
             time_sync_get_local_time(&local_time);
             time_sync_get_synced_time(&synced_time);
             
-            // 计算时钟误差
-            int64_t clock_error_us = (int64_t)synced_time.timestamp_us - (int64_t)local_time.timestamp_us;
-            double clock_error_ms = clock_error_us / 1000.0;
-            double clock_accuracy_ppm = 0.0;
-            if (local_time.timestamp_us > 0) {
-                clock_accuracy_ppm = (double)clock_error_us * 1000000.0 / (double)local_time.timestamp_us;
-            }
+            // 计算当前时钟误差
+            int64_t current_error_us = (int64_t)synced_time.timestamp_us - (int64_t)local_time.timestamp_us;
             
-            ESP_LOGI(TAG, "=== Time Sync Statistics ===");
-            ESP_LOGI(TAG, "Sync Count: %" PRIu32, stats.sync_count);
-            ESP_LOGI(TAG, "Current Offset: %" PRId64 " us", stats.current_offset_us);
-            ESP_LOGI(TAG, "Last Delay: %" PRIu32 " us", stats.last_delay_us);
-            ESP_LOGI(TAG, "Avg Delay: %" PRIu32 " us", stats.avg_delay_us);
-            ESP_LOGI(TAG, "Sync Quality: %d%%", stats.sync_quality);
-            ESP_LOGI(TAG, "Error Count: %" PRIu32, stats.error_count);
-            ESP_LOGI(TAG, "--- Device Clock Analysis ---");
-            ESP_LOGI(TAG, "Local Device Time: %" PRIu64 " us", local_time.timestamp_us);
-            ESP_LOGI(TAG, "Master Sync Time: %" PRIu64 " us", synced_time.timestamp_us);
-            ESP_LOGI(TAG, ">> CLOCK DIFFERENCE: %" PRId64 " us (%.3f ms) <<", clock_error_us, clock_error_ms);
-            ESP_LOGI(TAG, "Clock Drift Rate: %.2f ppm", clock_accuracy_ppm);
-            
-            // 显示时钟差异的含义
-            if (clock_error_us > 0) {
-                ESP_LOGI(TAG, "Status: Slave clock is BEHIND master by %.3f ms", clock_error_ms);
-            } else {
-                ESP_LOGI(TAG, "Status: Slave clock is AHEAD of master by %.3f ms", -clock_error_ms);
-            }
-            
-            // 精度等级评估
-            const char* precision_level;
-            if (llabs(clock_error_us) < 100) {
-                precision_level = "EXCELLENT (<100us)";
-            } else if (llabs(clock_error_us) < 1000) {
-                precision_level = "VERY_GOOD (<1ms)";
-            } else if (llabs(clock_error_us) < 10000) {
-                precision_level = "GOOD (<10ms)";
-            } else {
-                precision_level = "NEEDS_IMPROVEMENT (>10ms)";
-            }
-            ESP_LOGI(TAG, "Precision Level: %s", precision_level);
-            ESP_LOGI(TAG, "=============================");
+            ESP_LOGI(TAG, "=== TIME SYNC STATUS ===");
+            ESP_LOGI(TAG, "Sync count: %"PRIu32", Last sync quality: %d%%", 
+                     stats.sync_count, stats.sync_quality);
+            ESP_LOGI(TAG, "Current clock error: %"PRId64"us (%s)", 
+                     current_error_us, 
+                     (current_error_us == 0) ? "PERFECT" : 
+                     (llabs(current_error_us) < 10) ? "EXCELLENT" :
+                     (llabs(current_error_us) < 100) ? "VERY GOOD" : "POOR");
+            ESP_LOGI(TAG, "Average network delay: %"PRIu32"us", stats.avg_delay_us);
+            ESP_LOGI(TAG, "========================");
         }
     }
 }
 
 void app_main(void) {
+    ESP_LOGI(TAG, "ESP32-C6 Time Sync System Starting...");
+    
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -157,13 +132,8 @@ void app_main(void) {
     
     // 添加对等设备
     if (role == TIME_SYNC_ROLE_SLAVE) {
-        // 从机添加主机作为对等设备
         ESP_ERROR_CHECK(time_sync_add_peer(master_mac));
-        ESP_LOGI(TAG, "Added master peer: %02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(master_mac));
-    } else {
-        // 主机需要根据实际情况添加从机设备
-        // 这里可以添加已知的从机MAC地址
-        ESP_LOGI(TAG, "Master mode: waiting for slave connections");
+        ESP_LOGI(TAG, "Added master: %02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(master_mac));
     }
     
     // 启动时间同步
@@ -172,14 +142,5 @@ void app_main(void) {
     // 创建统计信息任务
     xTaskCreate(stats_task, "stats", 4096, NULL, 3, NULL);
     
-    ESP_LOGI(TAG, "Time sync demo started as %s", 
-             role == TIME_SYNC_ROLE_MASTER ? "MASTER" : "SLAVE");
-    
-    if (role == TIME_SYNC_ROLE_MASTER) {
-        ESP_LOGI(TAG, "Master ready. Slaves can now sync to this device.");
-        ESP_LOGI(TAG, "Master provides microsecond precision timestamps.");
-    } else {
-        ESP_LOGI(TAG, "Slave started. Will sync with master: %02x:%02x:%02x:%02x:%02x:%02x", MAC2STR(master_mac));
-        ESP_LOGI(TAG, "Note: Update master_mac[] with actual master MAC address for proper sync.");
-    }
+    ESP_LOGI(TAG, "Started as %s", role == TIME_SYNC_ROLE_MASTER ? "MASTER" : "SLAVE");
 }

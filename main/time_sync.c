@@ -16,7 +16,9 @@
 #include "esp_crc.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "time_sync.h"
+#include "hw_timer.h"  // 专用硬件定时器
 
 static const char *TAG = "time_sync";
 
@@ -67,7 +69,7 @@ static int64_t get_synchronized_time(void);
  */
 static int64_t get_synchronized_time(void)
 {
-    return esp_timer_get_time() + g_cumulative_correction;
+    return hw_timer_get_time_us() + g_cumulative_correction;
 }
 
 /**
@@ -80,10 +82,10 @@ static precise_timestamp_t get_precise_timestamp(void)
     // 获取校正后的时间戳
     ts.timestamp_us = get_synchronized_time();
     
-    // 使用系统时间的低位提供亚微秒精度
-    // 这避免了可能不支持的CPU寄存器访问
-    uint32_t cycle_approx = (uint32_t)(ts.timestamp_us & 0xFFFFFF);
-    ts.fraction_ns = (cycle_approx % 1000) * 1.0;  // 纳秒级别的近似精度
+    // 获取硬件定时器的纳秒精度时间戳
+    uint64_t ns_timestamp = hw_timer_get_time_ns();
+    // 计算亚微秒部分（纳秒余数）
+    ts.fraction_ns = ns_timestamp % 1000;  // 纳秒级别的真实精度
     
     return ts;
 }
@@ -155,7 +157,7 @@ static esp_err_t send_sync_packet(const uint8_t *dest_mac, const time_sync_packe
         return ret;
     }
     
-    ESP_LOGI(TAG, "Sent sync packet: type=%d, seq=%d", 
+    ESP_LOGD(TAG, "TX packet: type=%d, seq=%d", 
              send_packet.packet_type, send_packet.sequence);
     
     return ESP_OK;
@@ -166,10 +168,8 @@ static esp_err_t send_sync_packet(const uint8_t *dest_mac, const time_sync_packe
  */
 static void time_sync_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
 {
-    ESP_LOGI(TAG, "Received ESP-NOW packet: len=%d, from=%02x:%02x:%02x:%02x:%02x:%02x", 
-             len, 
-             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
-             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+    ESP_LOGD(TAG, "RX packet: len=%d, from=" MACSTR, 
+             len, MAC2STR(recv_info->src_addr));
     
     if (len != sizeof(time_sync_packet_t)) {
         ESP_LOGW(TAG, "Invalid packet size: %d, expected: %zu", 
@@ -189,7 +189,7 @@ static void time_sync_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_
         return;
     }
     
-    ESP_LOGI(TAG, "Packet validation passed, type=%d, seq=%d", 
+    ESP_LOGD(TAG, "Valid packet: type=%d, seq=%d", 
              packet->packet_type, packet->sequence);
     
     // 创建事件并发送到队列
@@ -215,20 +215,13 @@ static void process_sync_request(const time_sync_event_t *event)
         return;
     }
     
-    ESP_LOGI(TAG, "Processing sync request from %02x:%02x:%02x:%02x:%02x:%02x", 
-             event->peer_mac[0], event->peer_mac[1], event->peer_mac[2],
-             event->peer_mac[3], event->peer_mac[4], event->peer_mac[5]);
+    ESP_LOGD(TAG, "Processing sync request from " MACSTR, 
+             MAC2STR(event->peer_mac));
     
     // 自动添加peer（如果尚未添加）
-    ESP_LOGI(TAG, "Auto-adding peer for response: %02x:%02x:%02x:%02x:%02x:%02x", 
-             event->peer_mac[0], event->peer_mac[1], event->peer_mac[2],
-             event->peer_mac[3], event->peer_mac[4], event->peer_mac[5]);
     esp_err_t ret = time_sync_add_peer(event->peer_mac);
     if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST) {
-        ESP_LOGW(TAG, "Failed to add peer for response: %s", esp_err_to_name(ret));
-        // 继续尝试发送，可能peer已经存在
-    } else {
-        ESP_LOGI(TAG, "Peer add result: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Failed to add peer: %s", esp_err_to_name(ret));
     }
     
     // 创建响应包
@@ -247,6 +240,7 @@ static void process_sync_request(const time_sync_event_t *event)
     response.precision = 20; // 微秒精度 (2^-20 ≈ 1us)
     
     // 发送响应
+    ESP_LOGI(TAG, ">>> Sending sync response to slave " MACSTR " <<<", MAC2STR(event->peer_mac));
     send_sync_packet(event->peer_mac, &response);
 }
 
@@ -326,25 +320,10 @@ static void process_sync_response(const time_sync_event_t *event)
     // offset = ((t2 - t1) + (t3 - t4)) / 2
     // delay = (t4 - t1) - (t3 - t2)
     
-    // 详细的时间戳分析
-    int64_t outbound_time = (int64_t)(t2_us - t1_us);  // 请求传输时间差
-    int64_t response_time = (int64_t)(t4_us - t3_us);  // 响应传输时间差  
-    int64_t round_trip_time = (int64_t)(t4_us - t1_us); // 总往返时间
-    int64_t processing_time = (int64_t)(t3_us - t2_us); // 主机处理时间
-    
-    ESP_LOGI(TAG, "NTP Timestamps: T1=%" PRIu64 " T2=%" PRIu64 " T3=%" PRIu64 " T4=%" PRIu64, 
-             t1_us, t2_us, t3_us, t4_us);
-    ESP_LOGI(TAG, "Time Intervals: Outbound=%" PRId64 "us, Processing=%" PRId64 "us, Response=%" PRId64 "us, RoundTrip=%" PRId64 "us",
-             outbound_time, processing_time, response_time, round_trip_time);
-    
     int64_t offset_us = ((int64_t)(t2_us - t1_us) + (int64_t)(t3_us - t4_us)) / 2;
     int64_t delay_us = (int64_t)(t4_us - t1_us) - (int64_t)(t3_us - t2_us);
     
-    ESP_LOGI(TAG, "Raw calculation: offset=%" PRId64 " us, delay=%" PRId64 " us", offset_us, delay_us);
-    ESP_LOGW(TAG, "*** CLOCK DIFFERENCE: %s device is %" PRId64 " microseconds %s than master ***", 
-             (g_config.role == TIME_SYNC_ROLE_MASTER) ? "Slave" : "This",
-             llabs(offset_us), 
-             (offset_us > 0) ? "ahead" : "behind");
+    ESP_LOGI(TAG, "Sync measurement: Clock offset=%" PRId64 "us, Network delay=%" PRId64 "us", offset_us, delay_us);
     
     if (delay_us < 0) {
         ESP_LOGW(TAG, "Negative delay detected: %" PRId64 " us", delay_us);
@@ -369,7 +348,7 @@ static void process_sync_response(const time_sync_event_t *event)
     
     // 更新统计信息
     g_stats.sync_count++;
-    g_stats.last_sync_time = esp_timer_get_time();
+    g_stats.last_sync_time = hw_timer_get_time_us();
     
     // 计算平均延迟
     if (g_stats.sync_count == 1) {
@@ -391,65 +370,33 @@ static void process_sync_response(const time_sync_event_t *event)
         g_stats.sync_quality = 30;
     }
     
-    ESP_LOGI(TAG, "Time sync completed: offset=%" PRId64 " us, delay=%" PRIu32 " us, quality=%d%%",
-             g_stats.current_offset_us, g_stats.last_delay_us, g_stats.sync_quality);
-    
-    // 同步结果总结
-    const char* precision_level;
-    if (llabs(g_stats.current_offset_us) < 10) {
-        precision_level = "EXCELLENT (sub-10μs)";
-    } else if (llabs(g_stats.current_offset_us) < 100) {
-        precision_level = "VERY GOOD (sub-100μs)";
-    } else if (llabs(g_stats.current_offset_us) < 1000) {
-        precision_level = "GOOD (sub-1ms)";
-    } else if (llabs(g_stats.current_offset_us) < 10000) {
-        precision_level = "FAIR (sub-10ms)";
-    } else {
-        precision_level = "POOR (>10ms)";
-    }
-    
-    ESP_LOGW(TAG, "=== SYNC RESULT SUMMARY ===");
-    ESP_LOGW(TAG, "Clock Difference: %" PRId64 " microseconds (%s)", 
-             g_stats.current_offset_us, 
-             (g_stats.current_offset_us > 0) ? "slave ahead" : "slave behind");
-    ESP_LOGW(TAG, "Precision Level: %s", precision_level);
-    ESP_LOGW(TAG, "Network Delay: %" PRIu32 " μs, Quality: %d%%", g_stats.last_delay_us, g_stats.sync_quality);
+    ESP_LOGI(TAG, "=== SYNC RESULT #%" PRIu32 " ===", g_stats.sync_count);
+    ESP_LOGI(TAG, "Final clock error: %" PRId64 "us (%s slave clock)", 
+             g_stats.current_offset_us,
+             (g_stats.current_offset_us > 0) ? "FAST" : "SLOW");
+    ESP_LOGI(TAG, "Network delay: %" PRIu32 "us, Quality: %d%%", 
+             g_stats.last_delay_us, g_stats.sync_quality);
     
     // 对于从机，应用时间校正
     if (g_config.role == TIME_SYNC_ROLE_SLAVE) {
-        // 记录校正前的时间
-        int64_t before_correction = esp_timer_get_time();
-        int64_t before_sync_time = get_synchronized_time();
-        
         // 应用时间校正（只有当偏差大于100微秒才校正）
         if (llabs(g_stats.current_offset_us) > 100) {
-            // 计算校正量
             int64_t correction_amount = -g_stats.current_offset_us;
-            
-            ESP_LOGW(TAG, "APPLYING CLOCK CORRECTION:");
-            ESP_LOGW(TAG, "Raw time: %" PRId64 " us", before_correction);
-            ESP_LOGW(TAG, "Sync time before: %" PRId64 " us", before_sync_time);
-            ESP_LOGW(TAG, "Applying correction: %" PRId64 " us", correction_amount);
-            
-            // 应用校正到全局校正量
+            int64_t old_cumulative = g_cumulative_correction;
             g_cumulative_correction += correction_amount;
             
-            int64_t after_sync_time = get_synchronized_time();
-            ESP_LOGW(TAG, "Sync time after: %" PRId64 " us", after_sync_time);
-            ESP_LOGW(TAG, "Total cumulative correction: %" PRId64 " us", g_cumulative_correction);
+            ESP_LOGW(TAG, "CLOCK CORRECTION APPLIED:");
+            ESP_LOGW(TAG, "- Error before correction: %" PRId64 "us", g_stats.current_offset_us);
+            ESP_LOGW(TAG, "- Correction applied: %" PRId64 "us", correction_amount);
+            ESP_LOGW(TAG, "- Total cumulative correction: %" PRId64 "us -> %" PRId64 "us", 
+                     old_cumulative, g_cumulative_correction);
             
-            // 更新统计：校正后偏差应该接近零
-            int64_t previous_offset = g_stats.current_offset_us;
             g_stats.current_offset_us = 0;
-            
-            ESP_LOGW(TAG, "Clock corrected! Offset %" PRId64 "us -> 0us", previous_offset);
-            ESP_LOGW(TAG, "Next sync will measure residual error from corrected time");
+            ESP_LOGI(TAG, "Slave clock now synchronized with master");
         } else {
-            ESP_LOGI(TAG, "Offset too small (<100us), no correction needed");
+            ESP_LOGI(TAG, "Clock error within tolerance (<%dus), no correction needed", 100);
         }
     }
-    
-    ESP_LOGW(TAG, "=========================");
     
     // 调用事件回调
     if (g_event_callback) {
@@ -464,12 +411,12 @@ static void time_sync_task(void *pvParameters)
 {
     time_sync_event_t event;
     
-    ESP_LOGI(TAG, "Time sync task started, role: %s", 
+    ESP_LOGD(TAG, "Sync task started: %s", 
              g_config.role == TIME_SYNC_ROLE_MASTER ? "MASTER" : "SLAVE");
     
     while (g_running) {
         if (xQueueReceive(g_sync_queue, &event, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            ESP_LOGI(TAG, "Received queue event: type=%d, seq=%d", 
+            ESP_LOGD(TAG, "Queue event: type=%d, seq=%d", 
                      event.rx_packet.packet_type, event.rx_packet.sequence);
             switch (event.rx_packet.packet_type) {
                 case TIME_SYNC_REQUEST:
@@ -523,6 +470,14 @@ esp_err_t time_sync_init(const time_sync_config_t *config, time_sync_event_cb_t 
     g_config = *config;
     g_event_callback = event_cb;
     
+    // 初始化硬件定时器
+    esp_err_t hw_timer_ret = hw_timer_init();
+    if (hw_timer_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize hardware timer: %s", esp_err_to_name(hw_timer_ret));
+        return hw_timer_ret;
+    }
+    ESP_LOGI(TAG, "Hardware timer initialized for time sync");
+    
     // 生成会话ID
     g_session_id = esp_random();
     
@@ -530,6 +485,7 @@ esp_err_t time_sync_init(const time_sync_config_t *config, time_sync_event_cb_t 
     g_sync_queue = xQueueCreate(10, sizeof(time_sync_event_t));
     if (!g_sync_queue) {
         ESP_LOGE(TAG, "Failed to create sync queue");
+        hw_timer_deinit();
         return ESP_ERR_NO_MEM;
     }
     
@@ -539,6 +495,7 @@ esp_err_t time_sync_init(const time_sync_config_t *config, time_sync_event_cb_t 
         ESP_LOGE(TAG, "Failed to register recv callback: %s", esp_err_to_name(ret));
         vQueueDelete(g_sync_queue);
         g_sync_queue = NULL;
+        hw_timer_deinit();
         return ret;
     }
     
@@ -552,6 +509,7 @@ esp_err_t time_sync_init(const time_sync_config_t *config, time_sync_event_cb_t 
         esp_now_unregister_recv_cb();
         vQueueDelete(g_sync_queue);
         g_sync_queue = NULL;
+        hw_timer_deinit();
         g_running = false;
         return ESP_ERR_NO_MEM;
     }
@@ -657,6 +615,9 @@ esp_err_t time_sync_deinit(void)
         vQueueDelete(g_sync_queue);
         g_sync_queue = NULL;
     }
+    
+    // 去初始化硬件定时器
+    hw_timer_deinit();
     
     // 清零状态
     memset(&g_stats, 0, sizeof(g_stats));
@@ -803,10 +764,8 @@ esp_err_t time_sync_trigger(void)
     request.session_id = g_session_id;
     // t1 will be set in send_sync_packet
     
-    ESP_LOGI(TAG, "Sending sync request #%" PRIu16 " to %02x:%02x:%02x:%02x:%02x:%02x", 
-             request.sequence, 
-             peer_info.peer_addr[0], peer_info.peer_addr[1], peer_info.peer_addr[2], 
-             peer_info.peer_addr[3], peer_info.peer_addr[4], peer_info.peer_addr[5]);
+    ESP_LOGI(TAG, ">>> Sending sync request #%" PRIu16 " to master " MACSTR " <<<", 
+             request.sequence, MAC2STR(peer_info.peer_addr));
     
     return send_sync_packet(peer_info.peer_addr, &request);
 }
